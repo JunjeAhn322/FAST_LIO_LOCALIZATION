@@ -15,12 +15,12 @@ from sensor_msgs.msg import PointCloud2
 import ros2_numpy
 
 # Global constants (as before)
-MAP_VOXEL_SIZE = 0.4
-SCAN_VOXEL_SIZE = 0.1
+MAP_VOXEL_SIZE = 0.1
+SCAN_VOXEL_SIZE = 0.025
 FREQ_LOCALIZATION = 0.5         # Hz
-LOCALIZATION_TH = 0.95
+LOCALIZATION_TH = 0.1
 FOV = 6.28                       # radians
-FOV_FAR = 20                   # meters
+FOV_FAR = 30                   # meters
 
 # Global variables for the sake of this example
 global_map = None
@@ -52,6 +52,7 @@ class FastLioLocalization(Node):
 
         # Initialize global map (synchronously or via another subscription)
         self.wait_for_global_map()
+        self.previous_transformation = None
 
     def wait_for_global_map(self):
         self.get_logger().warn('Waiting for global map......')
@@ -70,6 +71,7 @@ class FastLioLocalization(Node):
         global_map = o3d.geometry.PointCloud()
         global_map.points = o3d.utility.Vector3dVector(self.msg_to_array(global_map_msg)[:, :3])
         global_map = self.voxel_down_sample(global_map, MAP_VOXEL_SIZE)
+        global_map.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
         self.get_logger().info('Global map received.')
 
     def initial_pose_callback(self, msg):
@@ -85,22 +87,40 @@ class FastLioLocalization(Node):
             self.global_localization(self.initial_pose)
         else:
             self.get_logger().warn('Waiting for initial pose or scan...')
+    
+    def get_difference(self, T_prev, T_curr):
+        R_prev = T_prev[:3, :3]
+        R_curr = T_curr[:3, :3]
+        p_prev = T_prev[:3, 3]
+        p_curr = T_curr[:3, 3]
+        angle = np.arccos((np.trace(R_prev @ R_curr.T) - 1) / 2)
+        
+        translation = np.linalg.norm((R_prev - R_curr) * self.T_odom_to_base_link[:3,3] + (p_prev - p_curr),2)
+         
+        return angle, translation
 
     def global_localization(self, pose_estimation):
         # Your implementation of global localization adapted for ROS2.
-        self.get_logger().info('Global localization by scan-to-map matching......')
         # Use a copy of the current scan for thread safety
         import copy
         scan_tobe_mapped = copy.copy(cur_scan)
-        # Time the registration process
-        tic = time.time()
         # Crop the global map in FOV and run registration (using your helper functions)
         global_map_in_FOV = self.crop_global_map_in_FOV(global_map, pose_estimation, cur_odom)
-        transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=5)
-        transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=transformation, scale=1)
-        toc = time.time()
-        self.get_logger().info('Registration time: {}'.format(toc - tic))
-        if fitness > LOCALIZATION_TH:
+    
+        if self.previous_transformation is None:
+            transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=5, max_iteration = 100)
+            transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=transformation, scale=1, max_iteration=100)
+            self.previous_transformation = transformation
+            angle = 0
+            translation = 0
+            fitness = 1
+        else:
+            # transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=1)
+            transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=1)
+            angle, translation = self.get_difference(self.previous_transformation, transformation)
+            self.previous_transformation = transformation
+        self.get_logger().info("Angle: {}, Translation: {}, Fitness {}".format(angle, translation, fitness))
+        if fitness > LOCALIZATION_TH and angle < 0.1 and translation < 0.5:
             global T_map_to_odom
             T_map_to_odom = transformation
             map_to_odom = Odometry()
@@ -116,8 +136,9 @@ class FastLioLocalization(Node):
             map_to_odom.header.stamp = cur_odom.header.stamp
             map_to_odom.header.frame_id = 'map'
             self.pub_map_to_odom.publish(map_to_odom)
+            self.previous_transformation = transformation
         else:
-            self.get_logger().warn('Localization fitness too low. Not updating transformation.')
+            self.get_logger().error('????????????????????????????????????????????????????')
 
     def cb_save_cur_scan(self, pc_msg):
         global cur_scan
@@ -158,31 +179,37 @@ class FastLioLocalization(Node):
         except Exception:
             return o3d.geometry.voxel_down_sample(pcd, voxel_size)
 
-    def registration_at_scale(self, pc_scan, pc_map, initial, scale):
+    def registration_at_scale(self, pc_scan, pc_map, initial, scale, max_iteration=20):
         result_icp = o3d.pipelines.registration.registration_icp(
             self.voxel_down_sample(pc_scan, SCAN_VOXEL_SIZE * scale),
             self.voxel_down_sample(pc_map, MAP_VOXEL_SIZE * scale),
             1.0 * scale,
             initial,
-            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20)
+            # o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration)
         )
         return result_icp.transformation, result_icp.fitness
 
     def crop_global_map_in_FOV(self, global_map, pose_estimation, cur_odom):
         # Similar implementation as before
-        T_odom_to_base_link = self.pose_to_mat(cur_odom)
-        T_map_to_base_link = np.matmul(pose_estimation, T_odom_to_base_link)
+        self.T_odom_to_base_link = self.pose_to_mat(cur_odom)
+        T_map_to_base_link = np.matmul(pose_estimation, self.T_odom_to_base_link)
         T_base_link_to_map = self.inverse_se3(T_map_to_base_link)
         global_map_in_map = np.array(global_map.points)
         global_map_in_map = np.column_stack([global_map_in_map, np.ones(len(global_map_in_map))])
         global_map_in_base_link = np.matmul(T_base_link_to_map, global_map_in_map.T).T
-        if FOV > 3.14:
+        if FOV > 3.14: # MID360
             indices = np.where(
-                (global_map_in_base_link[:, 0] < FOV_FAR) & (global_map_in_base_link[:, 0] > -FOV_FAR) &
-                (global_map_in_base_link[:, 1] < FOV_FAR) & (global_map_in_base_link[:, 1] > -FOV_FAR) &
-                (np.abs(np.arctan2(global_map_in_base_link[:, 1], global_map_in_base_link[:, 0])) < FOV / 2.0)
+            (global_map_in_base_link[:, 0]**2 + global_map_in_base_link[:, 1]**2 + global_map_in_base_link[:, 2]**2 <= FOV_FAR**2) &
+            (global_map_in_base_link[:, 2] >= -10)  & (global_map_in_base_link[:, 2] <= 10)
             )
+            
+            # indices = np.where(
+            #     (global_map_in_base_link[:, 0] < FOV_FAR) & (global_map_in_base_link[:, 0] > -FOV_FAR) &
+            #     (global_map_in_base_link[:, 1] < FOV_FAR) & (global_map_in_base_link[:, 1] > -FOV_FAR) &
+            #     (np.abs(np.arctan2(global_map_in_base_link[:, 1], global_map_in_base_link[:, 0])) < FOV / 2.0)
+            # )
         else:
             indices = np.where(
                 (global_map_in_base_link[:, 0] > 0) &
@@ -206,6 +233,9 @@ class FastLioLocalization(Node):
         # self.pub_submap.publish(ros2_numpy.msgify(PointCloud2, 
         #                                            np.array(global_map_in_FOV.points)[::10],
         #                                            header=header))
+        if len(global_map.normals) > 0:
+            normals = np.asarray(global_map.normals)[indices, :]
+            global_map_in_FOV.normals = o3d.utility.Vector3dVector(np.squeeze(normals))
         return global_map_in_FOV
 
     def inverse_se3(self, trans):
