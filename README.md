@@ -122,9 +122,9 @@ Support for higher frequency is coming soon.
 
 4. Provide initial pose
 ```shell
-rosrun fast_lio_localization publish_initial_pose.py 14.5 -7.5 0 -0.25 0 0 
+rosrun fast_lio_localization publish_initial_pose.py 14.5 -7.5 0 -0.25 0 0 0 
 ```
-The numerical value **14.5 -7.5 0 -0.25 0 0** denotes 6D pose **x y z yaw pitch roll** in map frame, 
+The numerical value **14.5 -7.5 0 -0.25 0 0 0** denotes position, quaternion **x y z q1 q2 q3 q4** in map frame, 
 which is a rough initial guess for **localization_test_scene_1.bag**. 
 
 The initial guess can also be provided by the '2D Pose Estimate' Tool in RVIZ.
