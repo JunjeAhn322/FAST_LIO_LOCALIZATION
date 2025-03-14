@@ -16,9 +16,9 @@ import ros2_numpy
 
 # Global constants (as before)
 MAP_VOXEL_SIZE = 0.1
-SCAN_VOXEL_SIZE = 0.025
+SCAN_VOXEL_SIZE = 0.1
 FREQ_LOCALIZATION = 0.5         # Hz
-LOCALIZATION_TH = 0.1
+LOCALIZATION_TH = 0.95
 FOV = 6.28                       # radians
 FOV_FAR = 30                   # meters
 
@@ -71,7 +71,8 @@ class FastLioLocalization(Node):
         global_map = o3d.geometry.PointCloud()
         global_map.points = o3d.utility.Vector3dVector(self.msg_to_array(global_map_msg)[:, :3])
         global_map = self.voxel_down_sample(global_map, MAP_VOXEL_SIZE)
-        global_map.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+        # point to plane normal estimation
+        # global_map.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
         self.get_logger().info('Global map received.')
 
     def initial_pose_callback(self, msg):
@@ -106,21 +107,21 @@ class FastLioLocalization(Node):
         scan_tobe_mapped = copy.copy(cur_scan)
         # Crop the global map in FOV and run registration (using your helper functions)
         global_map_in_FOV = self.crop_global_map_in_FOV(global_map, pose_estimation, cur_odom)
-    
+        tick = time.time()
         if self.previous_transformation is None:
             transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=5, max_iteration = 100)
             transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=transformation, scale=1, max_iteration=100)
-            self.previous_transformation = transformation
             angle = 0
             translation = 0
             fitness = 1
         else:
-            # transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=1)
+            # transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=5)
             transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=1)
             angle, translation = self.get_difference(self.previous_transformation, transformation)
-            self.previous_transformation = transformation
-        self.get_logger().info("Angle: {}, Translation: {}, Fitness {}".format(angle, translation, fitness))
-        if fitness > LOCALIZATION_TH and angle < 0.1 and translation < 0.5:
+
+        tock = time.time()
+        self.get_logger().info("Registration time: {}s".format(tock - tick))
+        if fitness > LOCALIZATION_TH:
             global T_map_to_odom
             T_map_to_odom = transformation
             map_to_odom = Odometry()
@@ -137,9 +138,10 @@ class FastLioLocalization(Node):
             map_to_odom.header.frame_id = 'map'
             self.pub_map_to_odom.publish(map_to_odom)
             self.previous_transformation = transformation
+            self.initial_pose = transformation
         else:
-            self.get_logger().error('????????????????????????????????????????????????????')
-
+            self.get_logger().info("Angle: {}, Translation: {}, Fitness {}".format(angle, translation, fitness))
+        
     def cb_save_cur_scan(self, pc_msg):
         global cur_scan
         # Process the incoming point cloud message similarly to your original code.
@@ -185,8 +187,8 @@ class FastLioLocalization(Node):
             self.voxel_down_sample(pc_map, MAP_VOXEL_SIZE * scale),
             1.0 * scale,
             initial,
-            # o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+            # o3d.pipelines.registration.TransformationEstimationPointToPlane(),
             o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration)
         )
         return result_icp.transformation, result_icp.fitness
@@ -200,16 +202,15 @@ class FastLioLocalization(Node):
         global_map_in_map = np.column_stack([global_map_in_map, np.ones(len(global_map_in_map))])
         global_map_in_base_link = np.matmul(T_base_link_to_map, global_map_in_map.T).T
         if FOV > 3.14: # MID360
-            indices = np.where(
-            (global_map_in_base_link[:, 0]**2 + global_map_in_base_link[:, 1]**2 + global_map_in_base_link[:, 2]**2 <= FOV_FAR**2) &
-            (global_map_in_base_link[:, 2] >= -10)  & (global_map_in_base_link[:, 2] <= 10)
-            )
-            
             # indices = np.where(
-            #     (global_map_in_base_link[:, 0] < FOV_FAR) & (global_map_in_base_link[:, 0] > -FOV_FAR) &
-            #     (global_map_in_base_link[:, 1] < FOV_FAR) & (global_map_in_base_link[:, 1] > -FOV_FAR) &
-            #     (np.abs(np.arctan2(global_map_in_base_link[:, 1], global_map_in_base_link[:, 0])) < FOV / 2.0)
+            # (global_map_in_base_link[:, 0]**2 + global_map_in_base_link[:, 1]**2 + global_map_in_base_link[:, 2]**2 <= FOV_FAR**2) &
+            # (global_map_in_base_link[:, 2] >= -10)  & (global_map_in_base_link[:, 2] <= 10)
             # )
+            
+            indices = np.where(
+                (global_map_in_base_link[:, 0] < FOV_FAR) & (global_map_in_base_link[:, 0] > -FOV_FAR) &
+                (global_map_in_base_link[:, 1] < FOV_FAR) & (global_map_in_base_link[:, 1] > -FOV_FAR)
+            )
         else:
             indices = np.where(
                 (global_map_in_base_link[:, 0] > 0) &
@@ -233,9 +234,11 @@ class FastLioLocalization(Node):
         # self.pub_submap.publish(ros2_numpy.msgify(PointCloud2, 
         #                                            np.array(global_map_in_FOV.points)[::10],
         #                                            header=header))
-        if len(global_map.normals) > 0:
-            normals = np.asarray(global_map.normals)[indices, :]
-            global_map_in_FOV.normals = o3d.utility.Vector3dVector(np.squeeze(normals))
+        
+        # point to plane normal estimation
+        # if len(global_map.normals) > 0:
+        #     normals = np.asarray(global_map.normals)[indices, :]
+        #     global_map_in_FOV.normals = o3d.utility.Vector3dVector(np.squeeze(normals))
         return global_map_in_FOV
 
     def inverse_se3(self, trans):
