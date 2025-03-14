@@ -167,13 +167,46 @@ class FastLioLocalization(Node):
         mat[:3, 3] = trans
         return mat
 
+    # def msg_to_array(self, pc_msg):
+    #     pc_array = ros2_numpy.numpify(pc_msg)
+    #     pc = np.zeros((len(pc_array), 3), dtype=np.float32)
+    #     pc[:, 0] = pc_array['x']
+    #     pc[:, 1] = pc_array['y']
+    #     pc[:, 2] = pc_array['z']
+    #     return pc
+    
+    # Point Cloud data error (I don't know why this error occurs)
+    def msg_to_array_custom(self, pc_msg):
+        # Check that point_step is as expected
+        ps = pc_msg.point_step  # should be 48 bytes
+        width = pc_msg.width    # number of points
+        total_expected = width * ps
+        if len(pc_msg.data) != total_expected:
+            print(f"Warning: Expected data length {total_expected}, got {len(pc_msg.data)}")
+        
+        # Define a dtype for just x, y, z fields (each float32) at the proper offsets.
+        # Even though the full point is 48 bytes, we only extract x, y, and z.
+        dtype_xyz = np.dtype({
+            'names': ['x', 'y', 'z'],
+            'formats': [np.float32, np.float32, np.float32],
+            'offsets': [0, 4, 8],
+            'itemsize': ps  # entire point size, so numpy skips the rest automatically
+        })
+        
+        # Use np.frombuffer to convert the raw data into our custom array
+        pc_array = np.frombuffer(pc_msg.data, dtype=dtype_xyz)
+        
+        # Optionally, if you want a simple (N,3) float32 array:
+        pc_xyz = np.empty((pc_array.shape[0], 3), dtype=np.float32)
+        pc_xyz[:, 0] = pc_array['x']
+        pc_xyz[:, 1] = pc_array['y']
+        pc_xyz[:, 2] = pc_array['z']
+        
+        return pc_xyz
+
+# Then in your callback, replace the call:
     def msg_to_array(self, pc_msg):
-        pc_array = ros2_numpy.numpify(pc_msg)
-        pc = np.zeros((len(pc_array), 3), dtype=np.float32)
-        pc[:, 0] = pc_array['x']
-        pc[:, 1] = pc_array['y']
-        pc[:, 2] = pc_array['z']
-        return pc
+        return self.msg_to_array_custom(pc_msg)
 
     def voxel_down_sample(self, pcd, voxel_size):
         try:
